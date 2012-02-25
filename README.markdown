@@ -1,7 +1,13 @@
-DynamoDB Storage Guide
+PAWDynamoDB Help Guide
 ----------------------
 
-The storage of objects will as closely follow a rest like api as possible. The reason for this is that we can make each DynamoDB 'table' into a complete database for an application and save on space and money and prevent unnecessary overhead. The DynamoDao will implement this spec behind the scenes out of sight to the user. Because of this, the DynamoDao interface will follow more of a standard hibernate / object mapping pattern. It is a successful pattern, so... 
+This project is an example of a multi-tenant single table AmazonDB Data Access Object. 
+
+#Why would we want to do this?#
+
+
+
+The storage of objects will as closely follow a rest like api as possible. The reason for this is that we can make each DynamoDB 'table' into a complete database for an application and save on space and money. The DynamoDao will implement this spec behind the scenes out of sight to the user. Because of this, the DynamoDao interface will follow more of a standard hibernate / object mapping pattern. It is a successful pattern, so... 
 
 Hashkey Implementation 
 ----------------------
