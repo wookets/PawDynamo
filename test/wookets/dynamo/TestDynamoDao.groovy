@@ -12,16 +12,21 @@ class TestDynamoDao {
   DynamoDao dynamoDao = new DynamoDao(TableName)
   
   @Test
+  void wipeDb() {
+    dynamoDao.deleteAll("Mock")
+  }
+  
+  @Test
   void testSave() {
     def mock = [id: "1", name: "Nate", _type: "Mock"]
     dynamoDao.save(mock, mock.id)
   }
   
-  @Test(expected=NullPointerException.class) 
+  @Test(expected=Exception.class) 
   void testSaveNull() {
     dynamoDao.save null, null
   }
-  @Test(expected=RuntimeException.class)
+  @Test(expected=Exception.class)
   void testSaveNoType() {
     dynamoDao.save([id:"3", name: "Mate"], "3")
   }
@@ -37,6 +42,30 @@ class TestDynamoDao {
     assert mock.id == "1"
     assert mock._type == "Mock"
     assert mock["hashkey"] == null
+  }
+  
+  @Test
+  void testLoadBatch() {
+    def mock1 = [id: "1", name: "Ram", _type: "Mock"]
+    def mock2 = [id: "2", name: "Cam", _type: "Mock"]
+    def mock3 = [id: "3", name: "Ham", _type: "Mock"]
+    dynamoDao.save(mock1, mock1.id)
+    dynamoDao.save(mock2, mock2.id)
+    dynamoDao.save(mock3, mock3.id)
+    List mocks = dynamoDao.loadBatch("Mock", ["2","3"])
+    mocks.each { mock ->
+      assert mock.name == "Cam" || mock.name == "Ham"
+    }
+    assert mocks.size() == 2
+  }
+  
+  @Test
+  void testLoadAll() {
+    List mocks = dynamoDao.loadAll("Mock")
+    mocks.each { mock ->
+      println mock.name
+    }
+    assert mocks.size() == 3
   }
   
   @Test

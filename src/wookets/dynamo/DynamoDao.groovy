@@ -36,7 +36,6 @@ import com.amazonaws.services.dynamodb.model.UpdateItemResult
 class DynamoDao {
   
   // set these to something else if you want...
-  DateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
   String tableName = "Set me to something..."
   
   AmazonDynamoDBClient client;
@@ -51,62 +50,59 @@ class DynamoDao {
     this.tableName = tableName
   } 
   
-  // save
+  /**
+   * Will save an object to the dynamo db table. 
+   * @param resource a generic groovy or java class that you want to save
+   * @param resourceId the id of the resource you are saving that will be used to construct the hashkey. Note, we don't 
+   *    make assumpts about what property you want your id to be used on.
+   */
   void save(Object resource, String resourceId, String tenantId = "default") {
-    String resourceTypeKey = DynamoUtil.resolveType(resource)
-    log.debug "Saving ${resourceTypeKey}::${resourceId} - ${tenantId}"
+    String resourceType = DynamoUtil.resolveType(resource)
+    log.debug "Saving ${resourceType}::${resourceId} - ${tenantId}"
     
-    def item = [:] // item to save
-    if(resource.class == null) { // dynamic object
-      resource.each { String prop, Object val ->
-        if(prop == "_type") return; // strip out '_type'
-        if(val == null) return; // dont waste space with null values
-        item[prop] = toDynamo(val)
-      }
-    } else { // typed object
-      resource.properties.each { String prop, Object val ->
-        if(prop == "class") return; // strip out java added properties
-        if(prop == "metaClass") return; // strip out groovy added properties
-        if(val == null) return; // we don't support storing nulls
-        item[prop] = toDynamo(val)
-      }
-    }
+    // convert resource to something dynamo understands
+    def item = DynamoUtil.convertObjectToDynamo(resource)
+    
     // set 'hashkey' property last so nothing can override it...
-    item["hashkey"] = toDynamo("${tenantId}#${resourceTypeKey}#${resourceId}")
+    item["hashkey"] = DynamoUtil.createKeyAttribute(tenantId, resourceType, resourceId)
     
+    // push request to dynamo
     PutItemRequest request = new PutItemRequest(tableName, item)
     PutItemResult result = client.putItem(request)
+    
+    // we also need to add this type:id to the tenant relationship row
+    updateTenantList("ADD", resourceType, resourceId, tenantId)
   }
   
   // read
-  Object load(Object resourceType, String resourceId, String tenantId = "default") {
+  /**
+   * Load a single object from dynamo db.
+   * @param resourceTypeObject
+   * @param resourceId
+   * @return a fully qualified java object if you pass in a Class for resourceType or a dynamic groovy object with [_type: "Mock"]
+   */
+  Object load(Object resourceTypeObject, String resourceId, String tenantId = "default") {
+    String resourceType = DynamoUtil.resolveType(resourceTypeObject)
     log.debug "Loading ${resourceType}::${resourceId} - ${tenantId}"
     
-    String resourceTypeKey = DynamoUtil.resolveType(resourceType)
-    Key key = new Key(toDynamo("${tenantId}#${resourceTypeKey}#${resourceId}"))
-    GetItemRequest request = new GetItemRequest(tableName, key)
+    GetItemRequest request = new GetItemRequest(tableName, DynamoUtil.createKey(tenantId, resourceType, resourceId))
     GetItemResult result = client.getItem(request)
-    
-    // do something if no result returned
-    if(result.item == null)
-      return null
-    
-    def obj = resourceType instanceof Class ? resourceType.newInstance() : [_type: resourceTypeKey] // return typed or dynamic
-    result.item.each { String prop, AttributeValue val ->
-      if(prop == "hashkey") return // strip out hashkey property...
-      obj[prop] = fromDynamo(val)
-    }
-    return obj
+    return DynamoUtil.convertObjectFromDynamo(result.item, resourceTypeObject)
   }
   
-  List loadBatch(Object resourceType, List resourceIds, String tenantId = "default") {
+  /**
+   * Load a group of objects from dynamo db.
+   * @param resourceType
+   * @param resourceIds
+   * @return a bunch of objects. limit == 100 or 1MB
+   */
+  List loadBatch(Object resourceTypeObject, List resourceIds, String tenantId = "default") {
+    String resourceType = DynamoUtil.resolveType(resourceTypeObject)
     log.debug "Loading multiple ${resourceType}::${resourceIds} - ${tenantId}"
     
-    String resourceTypeKey = DynamoUtil.resolveType(resourceType)
-    
     List keys = []
-    resourceIds.each { Object resourceId ->
-      keys.add(new Key(new AttributeValue().withS("${tenantId}#${resourceTypeKey}#${resourceId}"))) 
+    resourceIds.each { String resourceId ->
+      keys.add(DynamoUtil.createKey(tenantId, resourceType, resourceId))
     }
     Map requestItems = new HashMap<String, KeysAndAttributes>()
     requestItems.put(tableName, new KeysAndAttributes().withKeys(keys))
@@ -116,140 +112,107 @@ class DynamoDao {
     
     BatchResponse batchResults = result.getResponses().get(tableName) // the limit on this is 100 results or 1MB
     List results = []
-    batchResults.items.each { Map<String, AttributeValue> item ->
-      def obj = resourceType instanceof Class ? resourceType.newInstance() : [_type: resourceTypeKey] // return typed or dynamic
-      item.each { String prop, AttributeValue val ->
-        obj[prop] = fromDynamo(val)
-      }
-      results.add(obj)
+    batchResults.items.each { Map item ->
+      results.add(DynamoUtil.convertObjectFromDynamo(item, resourceTypeObject))
     }
     return results
   }
   
+  /**
+   * Load all objects for a tenant.
+   * @param resourceType
+   * @return valid java classes or dynamic groovy objects based on resourceType.
+   */
   List loadAll(Object resourceType, String tenantId = "default") {
-    String tableName = DynamoUtil.resolveType(resourceType)
-    ScanRequest scanRequest = new ScanRequest(tableName)
-    ScanResult result = client.scan(scanRequest);
-    
-    List objs = []
-    result.items.each { item ->
-      println item
-      def obj = resourceType instanceof Class ? resourceType.newInstance() : [_type: tableName] // return typed or dynamic
-      item.each { String prop, AttributeValue val ->
-        obj[prop] = fromDynamo(val)
-      }
-      objs.add(obj)
+    List resourceHashes = loadAllHash(resourceType, tenantId)
+    List resourceIds = []
+    resourceHashes.each { String resourceHash ->
+      resourceIds.add(resourceHash.split(":")[1])
     }
+    List objs = loadBatch(resourceType, resourceIds, tenantId) // query all actual objects
     return objs
   }
   
+  /**
+   * Load 'raw' hashes from the tenant relationship table.
+   * @param resourceType
+   * @return e.g. ["Mock:1", "Mock:3"]
+   */
+  List loadAllHash(Object resourceType, String tenantId = "default") {
+    String resourceTypeKey = DynamoUtil.resolveType(resourceType)
+    GetItemRequest request = new GetItemRequest(tableName, DynamoUtil.createKey(tenantId, resourceTypeKey))
+    GetItemResult result = client.getItem(request)
+    return DynamoUtil.fromDynamo(result.item["ul"])
+  }
+  
   // delete
-  void delete(Object resourceType, String resourceId, String tenantId = "default") {
+  /**
+   * Will remove an object from dynamo db.
+   * @param resourceTypeObject
+   * @param resourceId
+   */
+  void delete(Object resourceTypeObject, String resourceId, String tenantId = "default") {
+    String resourceType = DynamoUtil.resolveType(resourceTypeObject)
     log.debug "Deleting ${resourceType}::${resourceId} - ${tenantId}"
     
-    String resourceTypeKey = DynamoUtil.resolveType(resourceType)
-    Key key = new Key(toDynamo("${tenantId}#${resourceTypeKey}#${resourceId}"))
-    DeleteItemRequest request = new DeleteItemRequest(tableName, key)
+    DeleteItemRequest request = new DeleteItemRequest(tableName, DynamoUtil.createKey(tenantId, resourceType, resourceId))
     DeleteItemResult result = client.deleteItem(request)
+    
+    // remove from tenant relationship as well
+    updateTenantList("DELETE", resourceType, resourceId, tenantId)
   }
   
-  // update
-  void addToProperty(Object resourceType, String resourceId, String propertyName, Object propertyValue) {
-    log.debug "Adding ${resourceType} - ${resourceId} - ${propertyName} - ${propertyValue}"
+  void deleteAll(Object resourceType, String tenantId = "default") {
+    log.debug "Deleting all ${resourceType} - ${tenantId}"
     
-    String tableName = DynamoUtil.resolveType(resourceType)
-    Key key = new Key(toDynamo(resourceId))
-    def updateItems = new HashMap<String, AttributeValueUpdate>()
+    // load from tenant relationship
+    List objs = loadAllHash(resourceType, tenantId)
     
-    AttributeAction action = propertyValue instanceof Collection ? AttributeAction.ADD : AttributeAction.PUT
-    
-    updateItems.put(propertyName, new AttributeValueUpdate(toDynamo(propertyValue), action))
-    UpdateItemRequest request = new UpdateItemRequest(tableName, key, updateItems);          
-    UpdateItemResult result = client.updateItem(request);
+    // remove all object instances
+    objs.each { String hash ->
+      delete(resourceType, DynamoUtil.getObjectReferenceId(hash))
+    }
   }
   
-  void replaceProperty(Object resourceType, String resourceId, String propertyName, Object propertyValue) {
-    log.debug "Replacing ${resourceType} - ${resourceId} - ${propertyName} - ${propertyValue}"
+  /**
+   * Will update an individual property on an object. 
+   * @param action e.g. ADD or DELETE or PUT
+   * @param resourceTypeObject e.g. Mock.class or "Mock" etc
+   * @param resourceId
+   * @param propertyName the name of the property on the resource object
+   * @param propertyValue the value of the property that you want to add or put. If this is null, we assume a delete action which
+   *  will remove the property from the object (since we don't store null properties)
+   */
+  void updateProperty(String action, Object resourceTypeObject, String resourceId, String propertyName, Object propertyValue, String tenantId = "default") {
+    String resourceType = DynamoUtil.resolveType(resourceTypeObject)
+    log.debug "Updating tenant list ${action} - ${resourceType} - ${resourceId} - ${tenantId}"
     
-    String tableName = DynamoUtil.resolveType(resourceType)
-    Key key = new Key(toDynamo(resourceId))
     def updateItems = new HashMap<String, AttributeValueUpdate>()
-    
-    updateItems.put(propertyName, new AttributeValueUpdate(toDynamo(propertyValue), AttributeAction.PUT))
-    UpdateItemRequest request = new UpdateItemRequest(tableName, key, updateItems);
-    UpdateItemResult result = client.updateItem(request);
-  }
-  
-  void removeFromProperty(Object resourceType, String resourceId, String propertyName, Object propertyValue) {
-    log.debug "Removing ${resourceType} - ${resourceId} - ${propertyName} - ${propertyValue}"
-    
-    String tableName = DynamoUtil.resolveType(resourceType)
-    Key key = new Key(toDynamo(resourceId))
-    def updateItems = new HashMap<String, AttributeValueUpdate>()
-    
-    updateItems.put(propertyName, new AttributeValueUpdate(toDynamo(propertyValue), AttributeAction.DELETE))
+    if(propertyValue == null) 
+      updateItems.put(propertyName, new AttributeValueUpdate().withAction(DynamoUtil.resolveAction("DELETE"))) // special case to remove the property
+    else
+      updateItems.put(propertyName, new AttributeValueUpdate(DynamoUtil.toDynamo(propertyValue), DynamoUtil.resolveAction(action)))
+    Key key = DynamoUtil.createKey(tenantId, resourceType)
     UpdateItemRequest request = new UpdateItemRequest(tableName, key, updateItems)
     UpdateItemResult result = client.updateItem(request)
   }
   
-  void removeProperty(Object resourceType, String resourceId, String propertyName) {
-    log.debug "Removing ${resourceType} - ${resourceId} - ${propertyName}"
-    
-    String tableName = DynamoUtil.resolveType(resourceType)
-    String hashKey = resourceId
+  /**
+   * Will update the object in the tenant list of object references.
+   * @param action e.g. ADD or DELETE
+   * @param resourceTypeObject e.g. Mock.class or "Mock" or [_type: "Mock"] or new Mock()
+   * @param resourceId
+   */
+  private void updateTenantList(String action, Object resourceTypeObject, String resourceId, String tenantId = "default") {
+    String resourceType = DynamoUtil.resolveType(resourceTypeObject)
+    log.debug "Updating tenant list ${action} - ${resourceType} - ${resourceId} - ${tenantId}"
     
     def updateItems = new HashMap<String, AttributeValueUpdate>()
-    Key key = new Key().withHashKeyElement(new AttributeValue().withS(hashKey))
-    
-    updateItems.put(propertyName, new AttributeValueUpdate().withAction(AttributeAction.DELETE));
-    def updateItemRequest = new UpdateItemRequest().withTableName(tableName).withKey(key).withAttributeUpdates(updateItems);
-    UpdateItemResult result = client.updateItem(updateItemRequest);
+    String hash = DynamoUtil.createObjectReferenceHash(resourceType, resourceId)
+    updateItems.put("ul", new AttributeValueUpdate(DynamoUtil.toDynamo([hash]), DynamoUtil.resolveAction(action)))
+    Key key = DynamoUtil.createKey(tenantId, resourceType)
+    UpdateItemRequest request = new UpdateItemRequest(tableName, key, updateItems)
+    UpdateItemResult result = client.updateItem(request)
   }
   
-  
-  // private helper methods
-  
-  private AttributeValue toDynamo(Object value) {
-    if(value instanceof Number) { // number support
-      return new AttributeValue().withN(value)
-    } 
-    if(value instanceof String || value instanceof GString) { // string support
-      return new AttributeValue().withS(value)
-    }
-    if(value instanceof Collection) { // list support
-      if(value[0] instanceof Number) { // number list support
-        return new AttributeValue().withNS(value)
-      } else if(value[0] instanceof String) { // string list support
-        return new AttributeValue().withSS(value)
-      }
-    } 
-    if(value instanceof Boolean) { // boolean support
-      return new AttributeValue().withS(value ? "bool:true" : "bool:false")
-    } 
-    if(value instanceof Date) { // date support
-      return new AttributeValue().withS("date:" + dateFormatter.format(value))
-    }
-    throw new RuntimeException("Unsupported data type for value ${value}")
-  }
-  
-  private Object fromDynamo(AttributeValue value) {
-    if(value.getS() != null) {
-      String val = value.getS()
-      if(val == "bool:true") { // boolean support
-        return true
-      } else if(val == "bool:false") {
-        return false
-      } else if(val?.startsWith("date:")) { // date support
-        return dateFormatter.parse(val.substring(5))
-      } else { // string support
-        return val
-      }
-    } else if(value.getN() != null) { // number support
-      return value.getN()
-    } else if(value.getSS() != null) { // set of strings support
-      return value.getSS()
-    } else if(value.getNS() != null) { // set of numbers support
-      return value.getNS()
-    }
-  }
 }
